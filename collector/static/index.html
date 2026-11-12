@@ -37,6 +37,7 @@
   .kv .k { font-size: 12px; color: var(--muted); }
   .kv .v { font-size: 16px; font-weight: 600; margin-top: 2px; }
   .err { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 18px; }
+  .reason { color: var(--amber); font-size: 13px; margin-top: 6px; min-height: 18px; }
   label.sc { display: flex; align-items: center; gap: 8px; padding: 8px 0; font-size: 14px; cursor: pointer; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--amber); }
   input[type=number] { width: 90px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 8px; font-size: 14px; }
@@ -57,14 +58,18 @@
       <span id="statusBadge" class="badge stopped">已停止</span>
       <span style="color:var(--muted);font-size:13px">lastUpdateId (L)：<b id="luid" style="color:var(--text)">—</b></span>
       <span style="color:var(--muted);font-size:13px">档位：买 <b id="lvB" style="color:var(--text)">0</b> / 卖 <b id="lvA" style="color:var(--text)">0</b></span>
+      <span style="color:var(--muted);font-size:13px">数据年龄（最后有效推进至今）：<b id="dataAge" style="color:var(--text)">—</b></span>
     </div>
     <div class="kv">
       <div class="item"><div class="k">已应用增量</div><div class="v" id="stApplied">0</div></div>
       <div class="item"><div class="k">丢弃（重复/过期）</div><div class="v" id="stDropped">0</div></div>
+      <div class="item"><div class="k">忽略（心跳/非增量）</div><div class="v" id="stIgnored">0</div></div>
       <div class="item"><div class="k">缺号次数</div><div class="v" id="stGaps">0</div></div>
       <div class="item"><div class="k">重同步次数</div><div class="v" id="stResyncs">0</div></div>
+      <div class="item"><div class="k">停更撤价次数</div><div class="v" id="stStale">0</div></div>
       <div class="item"><div class="k">快照 成功/尝试</div><div class="v" id="stSnap">0/0</div></div>
     </div>
+    <div class="reason" id="pauseReason"></div>
     <div class="err" id="lastError"></div>
   </div>
 
@@ -100,9 +105,15 @@
         <label class="sc"><input type="checkbox" id="scGap"> 缺号注入（周期性跳过更新编号）</label>
         <label class="sc"><input type="checkbox" id="scDisc"> 断线注入（周期性关闭连接）</label>
       </div>
+      <div>
+        <label class="sc"><input type="checkbox" id="scSilent"> 保持连接但静默（只发心跳，不推增量）</label>
+        <label class="sc"><input type="checkbox" id="scRepeat"> 反复重发末条增量（编号不推进）</label>
+      </div>
     </div>
     <div class="hint">
-      验证要点：快照延迟期间增量被缓存、不就绪；重复消息按 u ≤ L 丢弃；缺号（U &gt; L+1）与断线立即停止发布并自动重同步；快照失败时状态绝不变为「已同步」。
+      验证要点：快照延迟期间增量被缓存、不就绪；重复消息与心跳不计入新鲜度；<b>连接正常但超过 3 秒没有推进增量时立即撤下报价并自动重同步</b>，
+      数据年龄与停更原因显示在上方；缓存增量按“实际接收时刻”计时，稍后应用不会重新计时；
+      首次就绪/重同步恢复必须已有接收不足 3 秒的推进增量，快照成功本身不足以就绪。
     </div>
   </div>
 </div>
@@ -126,9 +137,11 @@ function currentScenario() {
     duplicates: $("scDup").checked,
     gap: $("scGap").checked,
     disconnect: $("scDisc").checked,
+    silent: $("scSilent").checked,
+    repeat_last: $("scRepeat").checked,
   };
 }
-for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc"]) {
+for (const id of ["scDelay", "scDelayMs", "scFail", "scDup", "scGap", "scDisc", "scSilent", "scRepeat"]) {
   $(id).onchange = () => post("/api/scenario", currentScenario());
 }
 
@@ -150,9 +163,19 @@ async function refresh() {
     $("lvA").textContent = s.levels.asks;
     $("stApplied").textContent = s.stats.applied;
     $("stDropped").textContent = s.stats.dropped;
+    $("stIgnored").textContent = s.stats.ignored ?? 0;
     $("stGaps").textContent = s.stats.gaps;
     $("stResyncs").textContent = s.stats.resyncs;
+    $("stStale").textContent = s.stats.stale ?? 0;
     $("stSnap").textContent = `${s.stats.snapshotOk}/${s.stats.snapshotAttempts}`;
+    // 数据年龄：距最后一条“有效推进”增量实际接收的秒数（后端单调时钟计算）。
+    const age = s.dataAgeSeconds;
+    $("dataAge").textContent = age == null ? "—" : `${age.toFixed(2)} s`;
+    $("dataAge").style.color = age != null && age >= (s.staleAfterSeconds ?? 3) ? "var(--red)" : "var(--text)";
+    // 停更原因：未发布报价时展示后端给出的撤价/未就绪原因。
+    $("pauseReason").textContent = s.synced
+      ? ""
+      : (s.pauseReason ? "停更原因：" + s.pauseReason : "");
     $("lastError").textContent = s.lastError ? "最近异常：" + s.lastError : "";
     renderRows($("bidsBody"), s.bids, "bid");
     renderRows($("asksBody"), s.asks, "ask");
@@ -170,6 +193,8 @@ async function loadScenario() {
     $("scDup").checked = sc.duplicates;
     $("scGap").checked = sc.gap;
     $("scDisc").checked = sc.disconnect;
+    $("scSilent").checked = sc.silent;
+    $("scRepeat").checked = sc.repeat_last;
   } catch (e) { /* 忽略 */ }
 }
 

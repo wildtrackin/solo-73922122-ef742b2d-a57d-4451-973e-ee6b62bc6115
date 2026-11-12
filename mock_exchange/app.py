@@ -10,6 +10,11 @@
   duplicates         每条增量消息重复发送一次
   gap                周期性跳过更新编号（制造缺号）
   disconnect         周期性关闭全部 WebSocket 连接
+  silent             保持 WebSocket 连接但行情静默：只周期发送 heartbeat，不推送增量
+  repeat_last        行情停更：反复重发最后一条 depthUpdate（U/u 不再推进）
+
+silent 模式下仍会发送 heartbeat（WebSocket 也保持连接），用于验证采集端不会把
+心跳误当成行情更新；repeat_last 模式下重发的是同一条增量，采集端应按 u <= L 丢弃。
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ TICK = 0.1
 MAX_BAND = 150          # 模拟盘口维持在中间价 ±150 个 tick
 SNAPSHOT_LIMIT = 100
 TICK_INTERVAL = 0.2     # 增量推送间隔（秒）
+HEARTBEAT_EVERY_TICKS = 5  # 静默模式下约每秒发一次心跳
 
 
 class Scenario(BaseModel):
@@ -35,6 +41,8 @@ class Scenario(BaseModel):
     duplicates: bool = False
     gap: bool = False
     disconnect: bool = False
+    silent: bool = False
+    repeat_last: bool = False
 
 
 scenario = Scenario()
@@ -44,6 +52,7 @@ bids: dict[float, float] = {}
 asks: dict[float, float] = {}
 next_update_id = 1
 event_count = 0
+last_event: dict | None = None
 clients: set[WebSocket] = set()
 lock = asyncio.Lock()
 
@@ -109,25 +118,43 @@ async def close_all_clients() -> None:
 
 
 async def market_loop() -> None:
-    global next_update_id, event_count
+    global next_update_id, event_count, last_event
+    tick = 0
     while True:
         await asyncio.sleep(TICK_INTERVAL)
+        tick += 1
         async with lock:
-            b_changes, a_changes = mutate_book()
-            event_count += 1
-            if scenario.gap and event_count % 12 == 0:
-                # 缺号场景：跳过 2~5 个更新编号，采集端将看到 U > L+1
-                next_update_id += random.randint(2, 5)
-            event = {
-                "e": "depthUpdate",
-                "E": int(time.time() * 1000),
-                "s": SYMBOL,
-                "U": next_update_id,  # 本事件起始更新编号
-                "u": next_update_id,  # 本事件结束更新编号
-                "b": b_changes,
-                "a": a_changes,
-            }
-            next_update_id += 1
+            heartbeat: dict | None = None
+            event: dict | None = None
+
+            if scenario.silent:
+                # 保持连接但行情静默：不生成新编号、不修改盘口，只发心跳。
+                if tick % HEARTBEAT_EVERY_TICKS == 0:
+                    heartbeat = {"e": "heartbeat", "E": int(time.time() * 1000), "s": SYMBOL}
+            elif scenario.repeat_last:
+                # 反复重发末条增量：U/u 与已发布的最新一条相同，编号不推进。
+                event = last_event
+            else:
+                b_changes, a_changes = mutate_book()
+                event_count += 1
+                if scenario.gap and event_count % 12 == 0:
+                    # 缺号场景：跳过 2~5 个更新编号，采集端将看到 U > L+1
+                    next_update_id += random.randint(2, 5)
+                event = {
+                    "e": "depthUpdate",
+                    "E": int(time.time() * 1000),
+                    "s": SYMBOL,
+                    "U": next_update_id,  # 本事件起始更新编号
+                    "u": next_update_id,  # 本事件结束更新编号
+                    "b": b_changes,
+                    "a": a_changes,
+                }
+                next_update_id += 1
+                last_event = event
+
+        if heartbeat is not None:
+            await broadcast(heartbeat)
+        if event is not None:
             await broadcast(event)
             if scenario.disconnect and event_count % 40 == 0:
                 # 断线场景：广播后关闭全部连接

@@ -93,3 +93,54 @@ def test_trim_to_100_levels_per_side():
     assert len(book.bids) == 100 and len(book.asks) == 100
     assert max(book.bids) == 200.0          # 保留最优 100 档
     assert min(book.asks) == pytest.approx(200.1)
+
+
+# ----------------------- 新鲜度 / 行情停更规则 -----------------------
+
+def test_advancing_event_records_actual_receive_time():
+    book = new_book()
+    s = stats()
+    assert book.apply(ev(99, 101, b=[["100.0", "3.0000"]]), s, recv_mono=10.0) is True
+    assert book.last_advance_recv_mono == 10.0
+    assert book.last_advance_update_id == 101
+    # 接收至今不足 3 秒 → 新鲜；满 3 秒 → 不新鲜（严格小于阈值）
+    assert book.has_fresh_advance(now_mono=12.999, max_age=3.0)
+    assert not book.has_fresh_advance(now_mono=13.0, max_age=3.0)
+
+
+def test_duplicate_does_not_refresh_receive_time():
+    book = new_book()
+    s = stats()
+    assert book.apply(ev(101, 102, b=[["100.0", "3.0000"]]), s, recv_mono=10.0) is True
+    # 同一条/过期消息再次到达，u <= L，必须丢弃且不能续期
+    assert book.apply(ev(101, 102, b=[["100.0", "9.0000"]]), s, recv_mono=20.0) is False
+    assert book.last_advance_recv_mono == 10.0
+    assert book.bids[100.0] == 3.0
+    assert s["dropped"] == 1
+
+
+def test_cache_replayed_later_keeps_original_receive_time():
+    book = new_book()
+    s = stats()
+    # 模拟：t=1 收到，直到 t=10 才应用。新鲜度必须按 t=1 计算，不能重新计时。
+    book.apply(ev(101, 101, b=[["100.0", "3.0000"]]), s, recv_mono=1.0)
+    assert book.last_advance_recv_mono == 1.0
+    assert not book.has_fresh_advance(now_mono=10.0, max_age=3.0)
+    assert book.data_age(10.0) == pytest.approx(9.0)
+
+
+def test_snapshot_alone_is_not_fresh():
+    book = new_book()
+    assert book.last_advance_recv_mono is None
+    assert not book.has_fresh_advance(now_mono=0.0, max_age=3.0)
+    assert book.data_age(0.0) is None
+
+
+def test_gap_does_not_refresh_receive_time():
+    book = new_book()
+    s = stats()
+    book.apply(ev(99, 101, b=[["100.0", "3.0000"]]), s, recv_mono=1.0)
+    with pytest.raises(GapDetected):
+        book.apply(ev(105, 106, b=[["100.0", "9.0000"]]), s, recv_mono=2.0)
+    assert book.last_advance_recv_mono == 1.0
+    assert book.bids[100.0] == 3.0
